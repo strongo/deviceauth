@@ -1,0 +1,30 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'go.*'
+      - '**/*.go'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'go.*'
+      - '**/*.go'
+      - '.github/workflows/*.yml'
+
+jobs:
+  strongo_workflow:
+    permissions:
+      contents: write
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.14.17
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    with:
+      cgo_enabled: false
+      disable-version-bumping: false
+      code_coverage: true
+      min_test_coverage_percent: 70
