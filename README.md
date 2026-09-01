@@ -21,10 +21,17 @@ result, err := deviceauth.Login(ctx, deviceauth.LoginOptions{
 			TokenURL:      "https://cloud.example.com/oauth/token",
 		},
 	},
+	DeviceInfo: deviceauth.DeviceInfo{
+		Name: "Alex's MacBook Pro", OS: "darwin", Arch: "arm64", ClientVersion: "1.2.3",
+	},
 	OpenBrowser: deviceauth.OpenBrowser,
 	Output:      os.Stdout,
 	ErrorOutput: os.Stderr,
 })
 ```
+
+`DeviceInfo` is sent as optional device-authorization request parameters so a
+server can identify the requesting device during consent. It is informational,
+untrusted metadata; authorization state and timestamps remain server-owned.
 
 The module is MIT licensed.

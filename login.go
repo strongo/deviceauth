@@ -8,14 +8,45 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 
 	"golang.org/x/oauth2"
 )
+
+// DeviceInfo describes the command-line device requesting authorization.
+// Authorization servers may display these optional, untrusted values during
+// consent and retain them with the resulting grant.
+type DeviceInfo struct {
+	Name          string
+	OS            string
+	Arch          string
+	ClientVersion string
+}
+
+func (v DeviceInfo) authCodeOptions() []oauth2.AuthCodeOption {
+	values := []struct {
+		name  string
+		value string
+	}{
+		{name: "device_name", value: v.Name},
+		{name: "os", value: v.OS},
+		{name: "arch", value: v.Arch},
+		{name: "client_version", value: v.ClientVersion},
+	}
+	options := make([]oauth2.AuthCodeOption, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value.value); trimmed != "" {
+			options = append(options, oauth2.SetAuthURLParam(value.name, trimmed))
+		}
+	}
+	return options
+}
 
 // LoginOptions configures one browser-approved OAuth 2.0 device login.
 // Product-specific commands own the OAuth endpoints, client ID, and scopes.
 type LoginOptions struct {
 	OAuthConfig oauth2.Config
+	DeviceInfo  DeviceInfo
 	OpenBrowser func(string) error
 	Output      io.Writer
 	ErrorOutput io.Writer
@@ -38,7 +69,7 @@ func Login(ctx context.Context, options LoginOptions) (LoginResult, error) {
 		return LoginResult{}, err
 	}
 
-	authorization, err := options.OAuthConfig.DeviceAuth(ctx)
+	authorization, err := options.OAuthConfig.DeviceAuth(ctx, options.DeviceInfo.authCodeOptions()...)
 	if err != nil {
 		return LoginResult{}, fmt.Errorf("request device authorization: %w", err)
 	}
