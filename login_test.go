@@ -26,6 +26,16 @@ func TestLoginCompletesDeviceAuthorization(t *testing.T) {
 			if got := r.FormValue("scope"); got != "account:read" {
 				t.Fatalf("scope = %q, want account:read", got)
 			}
+			for name, want := range map[string]string{
+				"device_name":    "Alex's MacBook Pro",
+				"os":             "darwin",
+				"arch":           "arm64",
+				"client_version": "0.2.0",
+			} {
+				if got := r.FormValue(name); got != want {
+					t.Fatalf("%s = %q, want %q", name, got, want)
+				}
+			}
 			writeJSON(t, w, map[string]any{
 				"device_code":               "device-secret",
 				"user_code":                 "ABCD-EFGH",
@@ -64,6 +74,9 @@ func TestLoginCompletesDeviceAuthorization(t *testing.T) {
 				TokenURL:      server.URL + "/oauth/token",
 			},
 		},
+		DeviceInfo: DeviceInfo{
+			Name: " Alex's MacBook Pro ", OS: "darwin", Arch: "arm64", ClientVersion: "0.2.0",
+		},
 		OpenBrowser: func(rawURL string) error {
 			opened = rawURL
 			return nil
@@ -88,6 +101,53 @@ func TestLoginCompletesDeviceAuthorization(t *testing.T) {
 	}
 	if errorOutput.Len() != 0 {
 		t.Fatalf("error output = %q", errorOutput.String())
+	}
+}
+
+func TestLoginOmitsEmptyDeviceInfo(t *testing.T) {
+	t.Parallel()
+
+	server := immediateAuthorizationServer(t)
+	defer server.Close()
+
+	client := server.Client()
+	originalTransport := client.Transport
+	client.Transport = roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/device" {
+			if err := request.ParseForm(); err != nil {
+				t.Fatalf("parse device authorization form: %v", err)
+			}
+			for _, name := range []string{"device_name", "os", "arch", "client_version"} {
+				if _, exists := request.Form[name]; exists {
+					t.Fatalf("empty %s must be omitted", name)
+				}
+			}
+			if request.GetBody != nil {
+				body, err := request.GetBody()
+				if err != nil {
+					t.Fatalf("restore device authorization form: %v", err)
+				}
+				request.Body = body
+			}
+		}
+		return originalTransport.RoundTrip(request)
+	})
+
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, client)
+	_, err := Login(ctx, LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: server.URL + "/device",
+				TokenURL:      server.URL + "/token",
+			},
+		},
+		DeviceInfo:  DeviceInfo{Name: "  "},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
 	}
 }
 
@@ -218,4 +278,10 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatalf("encode response: %v", err)
 	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
