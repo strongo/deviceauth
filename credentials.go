@@ -21,9 +21,15 @@ type Credential struct {
 	TokenType    string    `json:"token_type,omitempty"`
 	RefreshToken string    `json:"refresh_token,omitempty"`
 	Expiry       time.Time `json:"expiry,omitempty"`
-	AccountID    string    `json:"account_id,omitempty"`
-	AccountName  string    `json:"account_name,omitempty"`
-	Scopes       []string  `json:"scopes,omitempty"`
+	// Issuer and ClientID bind a persisted credential to the authorization
+	// service and public OAuth client that issued it. They are set by a
+	// Client's ScopedStore; the fields remain optional for backwards
+	// compatibility with credentials saved by older callers.
+	Issuer      string   `json:"issuer,omitempty"`
+	ClientID    string   `json:"client_id,omitempty"`
+	AccountID   string   `json:"account_id,omitempty"`
+	AccountName string   `json:"account_name,omitempty"`
+	Scopes      []string `json:"scopes,omitempty"`
 }
 
 // Store persists and removes one credential selected by the concrete store's
