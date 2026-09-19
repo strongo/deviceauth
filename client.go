@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -25,9 +26,13 @@ var ErrCredentialScopeMismatch = errors.New("deviceauth: credential issuer or cl
 // "https://auth.sneat.co". KeyringService and KeyringAccount are product
 // chosen names used only when NewKeyringStore is called.
 type ClientConfig struct {
-	Issuer         string
-	ClientID       string
-	Scopes         []string
+	Issuer   string
+	ClientID string
+	Scopes   []string
+	// RequiredScopes is the subset of requested Scopes a caller requires for a
+	// usable session. It is checked against the issuer's authoritative
+	// userinfo scope claim; an omitted scope claim is never treated as a grant.
+	RequiredScopes []string
 	KeyringService string
 	KeyringAccount string
 }
@@ -39,6 +44,7 @@ type Client struct {
 	issuer         *url.URL
 	clientID       string
 	scopes         []string
+	requiredScopes []string
 	keyringService string
 	keyringAccount string
 }
@@ -57,10 +63,15 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if len(scopes) == 0 {
 		return nil, errors.New("deviceauth: at least one scope is required")
 	}
+	requiredScopes := compactStrings(config.RequiredScopes)
+	if err := validateRequiredScopesRequested(scopes, requiredScopes); err != nil {
+		return nil, err
+	}
 	return &Client{
 		issuer:         issuer,
 		clientID:       clientID,
 		scopes:         scopes,
+		requiredScopes: requiredScopes,
 		keyringService: strings.TrimSpace(config.KeyringService),
 		keyringAccount: strings.TrimSpace(config.KeyringAccount),
 	}, nil
@@ -77,6 +88,7 @@ func (c *Client) OAuthConfig() oauth2.Config {
 		Endpoint: oauth2.Endpoint{
 			DeviceAuthURL: c.endpoint("oauth/device/code"),
 			TokenURL:      c.endpoint("oauth/token"),
+			AuthStyle:     oauth2.AuthStyleInParams,
 		},
 	}
 }
@@ -200,6 +212,13 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 	if store == nil {
 		return Authentication{}, errors.New("deviceauth: credential store is required")
 	}
+	scopedStore := c.ScopedStore(store)
+	previous, err := scopedStore.Load()
+	if err != nil && !errors.Is(err, ErrCredentialNotFound) {
+		return Authentication{}, fmt.Errorf("load existing device credential: %w", err)
+	}
+	hasPrevious := err == nil
+
 	login, err := c.DeviceLogin(ctx, options)
 	if err != nil {
 		return Authentication{Login: login}, err
@@ -208,15 +227,18 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 	if options.TokenTransformer != nil {
 		sessionToken, err = options.TokenTransformer(ctx, login.Token)
 		if err != nil {
-			return Authentication{Login: login}, fmt.Errorf("transform device token: %w", err)
+			return Authentication{Login: login}, c.withTokenCleanup(ctx, fmt.Errorf("transform device token: %w", err), login.Token)
 		}
 		if sessionToken == nil || strings.TrimSpace(sessionToken.AccessToken) == "" {
-			return Authentication{Login: login}, errors.New("deviceauth: token transformer returned an empty access token")
+			return Authentication{Login: login}, c.withTokenCleanup(ctx, errors.New("deviceauth: token transformer returned an empty access token"), login.Token)
 		}
 	}
 	identity, err := c.UserInfo(ctx, sessionToken)
 	if err != nil {
-		return Authentication{Login: login, SessionToken: sessionToken}, err
+		return Authentication{Login: login, SessionToken: sessionToken}, c.withTokenCleanup(ctx, err, login.Token, sessionToken)
+	}
+	if err := ValidateRequiredScopes(identity.Scopes, c.requiredScopes); err != nil {
+		return Authentication{Login: login, SessionToken: sessionToken, Identity: identity}, c.withTokenCleanup(ctx, err, login.Token, sessionToken)
 	}
 	credential := Credential{
 		AccessToken:  sessionToken.AccessToken,
@@ -227,14 +249,81 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 		AccountName:  firstNonEmpty(identity.Name, identity.Email),
 		Scopes:       append([]string(nil), identity.Scopes...),
 	}
-	if len(credential.Scopes) == 0 {
-		credential.Scopes = append([]string(nil), c.scopes...)
-	}
 	credential = c.bindCredential(credential)
-	if err := store.Save(credential); err != nil {
-		return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, fmt.Errorf("save device credential: %w", err)
+	if err := scopedStore.Save(credential); err != nil {
+		return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, c.withTokenCleanup(ctx, fmt.Errorf("save device credential: %w", err), login.Token, sessionToken)
+	}
+	if hasPrevious && previous.AccessToken != credential.AccessToken {
+		if err := c.Revoke(ctx, previous.AccessToken); err != nil {
+			return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, fmt.Errorf("revoke replaced device credential: %w", err)
+		}
 	}
 	return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, nil
+}
+
+// ValidateRequiredScopes verifies that every explicitly required scope was
+// granted by the issuer. With no requirements it succeeds; an absent or
+// reduced granted scope claim never becomes a synthetic requested grant.
+func ValidateRequiredScopes(granted, required []string) error {
+	for _, scope := range compactStrings(required) {
+		if !contains(granted, scope) {
+			return fmt.Errorf("deviceauth: required scope %q was not granted", scope)
+		}
+	}
+	return nil
+}
+
+func validateRequiredScopesRequested(requested, required []string) error {
+	for _, scope := range required {
+		if !contains(requested, scope) {
+			return fmt.Errorf("deviceauth: required scope %q is not requested", scope)
+		}
+	}
+	return nil
+}
+
+func (c *Client) withTokenCleanup(ctx context.Context, primary error, tokens ...*oauth2.Token) error {
+	var cleanupErrors []error
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		if token == nil || strings.TrimSpace(token.AccessToken) == "" {
+			continue
+		}
+		if _, exists := seen[token.AccessToken]; exists {
+			continue
+		}
+		seen[token.AccessToken] = struct{}{}
+		if err := c.Revoke(ctx, token.AccessToken); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("revoke incomplete device login: %w", err))
+		}
+	}
+	primary = redactTokens(primary, seen)
+	if len(cleanupErrors) == 0 {
+		return primary
+	}
+	return errors.Join(append([]error{primary}, cleanupErrors...)...)
+}
+
+type tokenRedactedError struct {
+	err      error
+	tokenSet map[string]struct{}
+}
+
+func (e tokenRedactedError) Error() string {
+	message := e.err.Error()
+	for token := range e.tokenSet {
+		message = strings.ReplaceAll(message, token, "[redacted]")
+	}
+	return message
+}
+
+func (e tokenRedactedError) Unwrap() error { return e.err }
+
+func redactTokens(err error, tokenSet map[string]struct{}) error {
+	if err == nil || len(tokenSet) == 0 {
+		return err
+	}
+	return tokenRedactedError{err: err, tokenSet: tokenSet}
 }
 
 // ScopedStore wraps store so every saved credential is bound to this issuer
@@ -327,6 +416,9 @@ type scopedStore struct {
 }
 
 func (s scopedStore) Save(credential Credential) error {
+	if (credential.Issuer != "" && credential.Issuer != s.issuer) || (credential.ClientID != "" && credential.ClientID != s.clientID) {
+		return ErrCredentialScopeMismatch
+	}
 	credential.Issuer = s.issuer
 	credential.ClientID = s.clientID
 	return s.store.Save(credential)
@@ -350,15 +442,50 @@ func parseIssuer(rawIssuer string) (*url.URL, error) {
 	if err != nil || issuer.Scheme == "" || issuer.Host == "" {
 		return nil, errors.New("deviceauth: issuer must be an absolute URL")
 	}
-	if issuer.Scheme != "https" && issuer.Scheme != "http" {
-		return nil, errors.New("deviceauth: issuer URL scheme must be http or https")
+	if issuer.User != nil {
+		return nil, errors.New("deviceauth: issuer URL must not contain userinfo")
 	}
 	if issuer.RawQuery != "" || issuer.Fragment != "" {
 		return nil, errors.New("deviceauth: issuer URL must not contain a query or fragment")
 	}
-	issuer.Path = strings.TrimRight(issuer.Path, "/")
+	if issuer.RawPath != "" {
+		return nil, errors.New("deviceauth: issuer URL must not contain an encoded path")
+	}
+	issuer.Scheme = strings.ToLower(issuer.Scheme)
+	hostname := strings.ToLower(issuer.Hostname())
+	if hostname == "" {
+		return nil, errors.New("deviceauth: issuer URL host is required")
+	}
+	if issuer.Scheme != "https" && !(issuer.Scheme == "http" && isLoopbackHost(hostname)) {
+		return nil, errors.New("deviceauth: issuer must use https unless its host is loopback")
+	}
+	port := issuer.Port()
+	if (issuer.Scheme == "https" && port == "443") || (issuer.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port == "" {
+		if strings.Contains(hostname, ":") {
+			issuer.Host = "[" + hostname + "]"
+		} else {
+			issuer.Host = hostname
+		}
+	} else {
+		issuer.Host = net.JoinHostPort(hostname, port)
+	}
+	issuer.Path = strings.TrimRight(path.Clean(issuer.Path), "/")
+	if issuer.Path == "." || issuer.Path == "/" {
+		issuer.Path = ""
+	}
 	issuer.RawPath = ""
 	return issuer, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func decodeStringOrArray(raw json.RawMessage, field string, optional bool) ([]string, error) {
@@ -429,11 +556,40 @@ func httpClient(ctx context.Context) *http.Client {
 	return http.DefaultClient
 }
 
-func responseError(operation string, response *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		return fmt.Errorf("%s request failed: %s", operation, response.Status)
+// ResponseError is a redacted non-success response from the authorization
+// service. It deliberately excludes arbitrary response text, which may carry
+// secrets or HTML from a proxy. OAuthError is populated only for a safe OAuth
+// error code.
+type ResponseError struct {
+	Operation  string
+	StatusCode int
+	OAuthError string
+}
+
+func (e *ResponseError) Error() string {
+	if e.OAuthError != "" {
+		return fmt.Sprintf("deviceauth: %s request failed with HTTP %d (%s)", e.Operation, e.StatusCode, e.OAuthError)
 	}
-	return fmt.Errorf("%s request failed: %s: %s", operation, response.Status, message)
+	return fmt.Sprintf("deviceauth: %s request failed with HTTP %d", e.Operation, e.StatusCode)
+}
+
+func responseError(operation string, response *http.Response) error {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload)
+	return &ResponseError{
+		Operation:  operation,
+		StatusCode: response.StatusCode,
+		OAuthError: safeOAuthErrorCode(payload.Error),
+	}
+}
+
+func safeOAuthErrorCode(value string) string {
+	switch value {
+	case "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope", "authorization_pending", "slow_down", "access_denied", "expired_token":
+		return value
+	default:
+		return ""
+	}
 }
