@@ -395,6 +395,79 @@ func TestClientDeviceLoginAndStoreRevokesReplacedCredential(t *testing.T) {
 	}
 }
 
+func TestClientDeviceLoginAndStoreWarnsWhenReplacedCredentialCannotBeRevoked(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/device/code":
+			writeJSON(t, w, map[string]any{"device_code": "device-secret", "user_code": "ABCD", "verification_uri": server.URL + "/device", "expires_in": 600, "interval": 1})
+		case "/oauth/token":
+			writeJSON(t, w, map[string]string{"access_token": "new-token", "token_type": "Bearer"})
+		case "/oauth/userinfo":
+			writeJSON(t, w, map[string]any{"sub": "user-1", "aud": "sneat-cli", "scope": "profile:read"})
+		case "/oauth/revoke":
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, "sneat-cli")
+	store := &memoryStore{credential: Credential{AccessToken: "old-token", Issuer: server.URL, ClientID: "sneat-cli"}}
+	result, err := client.DeviceLoginAndStore(context.Background(), DeviceLoginOptions{Output: &bytes.Buffer{}, ErrorOutput: &bytes.Buffer{}}, store)
+	if err != nil {
+		t.Fatalf("DeviceLoginAndStore() error = %v", err)
+	}
+	if result.Credential.AccessToken != "new-token" || store.credential.AccessToken != "new-token" {
+		t.Fatalf("credential = %#v, store = %#v", result.Credential, store.credential)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+	var warning *ReplacementRevocationWarning
+	if !errors.As(result.Warnings[0], &warning) {
+		t.Fatalf("warning = %T", result.Warnings[0])
+	}
+}
+
+func TestClientDeviceLoginAndStoreCleansUpAfterCallerCancellation(t *testing.T) {
+	var revoked string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/device/code":
+			writeJSON(t, w, map[string]any{"device_code": "device-secret", "user_code": "ABCD", "verification_uri": server.URL + "/device", "expires_in": 600, "interval": 1})
+		case "/oauth/token":
+			writeJSON(t, w, map[string]string{"access_token": "bootstrap-token", "token_type": "custom"})
+		case "/oauth/revoke":
+			revoked = r.FormValue("token")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newTestClient(t, server.URL, "sneat-cli")
+	_, err := client.DeviceLoginAndStore(ctx, DeviceLoginOptions{
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+		TokenTransformer: func(_ context.Context, token *oauth2.Token) (*oauth2.Token, error) {
+			cancel()
+			return nil, fmt.Errorf("exchange rejected %s", token.AccessToken)
+		},
+	}, &memoryStore{})
+	if err == nil || strings.Contains(err.Error(), "bootstrap-token") {
+		t.Fatalf("DeviceLoginAndStore() error = %v", err)
+	}
+	if revoked != "bootstrap-token" {
+		t.Fatalf("revoked token = %q", revoked)
+	}
+}
+
 func TestClientRevokeRedactsResponseBody(t *testing.T) {
 	t.Parallel()
 

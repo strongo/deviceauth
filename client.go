@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -202,7 +203,24 @@ type Authentication struct {
 	SessionToken *oauth2.Token
 	Identity     Identity
 	Credential   Credential
+	// Warnings report completed logins that need operator attention but are
+	// safe to use. In particular, a new local credential remains valid when a
+	// replaced server token could not be revoked.
+	Warnings []error
 }
+
+// ReplacementRevocationWarning reports that a new credential was saved but
+// the previous credential could not be revoked. The authentication succeeded;
+// callers may surface this warning and retry revocation later.
+type ReplacementRevocationWarning struct {
+	Cause error
+}
+
+func (e *ReplacementRevocationWarning) Error() string {
+	return "deviceauth: new credential was saved but the previous credential could not be revoked"
+}
+
+func (e *ReplacementRevocationWarning) Unwrap() error { return e.Cause }
 
 // DeviceLoginAndStore completes device authorization, validates userinfo, and
 // saves a credential bound to this issuer and client. The supplied store is
@@ -255,7 +273,13 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 	}
 	if hasPrevious && previous.AccessToken != credential.AccessToken {
 		if err := c.Revoke(ctx, previous.AccessToken); err != nil {
-			return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, fmt.Errorf("revoke replaced device credential: %w", err)
+			return Authentication{
+				Login:        login,
+				SessionToken: sessionToken,
+				Identity:     identity,
+				Credential:   credential,
+				Warnings:     []error{&ReplacementRevocationWarning{Cause: err}},
+			}, nil
 		}
 	}
 	return Authentication{Login: login, SessionToken: sessionToken, Identity: identity, Credential: credential}, nil
@@ -285,6 +309,8 @@ func validateRequiredScopesRequested(requested, required []string) error {
 func (c *Client) withTokenCleanup(ctx context.Context, primary error, tokens ...*oauth2.Token) error {
 	var cleanupErrors []error
 	seen := make(map[string]struct{}, len(tokens))
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
 	for _, token := range tokens {
 		if token == nil || strings.TrimSpace(token.AccessToken) == "" {
 			continue
@@ -293,7 +319,7 @@ func (c *Client) withTokenCleanup(ctx context.Context, primary error, tokens ...
 			continue
 		}
 		seen[token.AccessToken] = struct{}{}
-		if err := c.Revoke(ctx, token.AccessToken); err != nil {
+		if err := c.Revoke(cleanupCtx, token.AccessToken); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("revoke incomplete device login: %w", err))
 		}
 	}
@@ -302,6 +328,16 @@ func (c *Client) withTokenCleanup(ctx context.Context, primary error, tokens ...
 		return primary
 	}
 	return errors.Join(append([]error{primary}, cleanupErrors...)...)
+}
+
+const cleanupTimeout = 5 * time.Second
+
+// cleanupContext keeps local context values (including tracing values) for
+// transport instrumentation, but removes its cancellation and deadline. The
+// bounded timeout prevents cleanup from turning a failed login into an
+// unbounded background request.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
 type tokenRedactedError struct {
