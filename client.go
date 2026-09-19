@@ -160,7 +160,7 @@ func (c *Client) UserInfo(ctx context.Context, token *oauth2.Token) (Identity, e
 	if err != nil {
 		return Identity{}, fmt.Errorf("request userinfo: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return Identity{}, responseError("userinfo", response)
 	}
@@ -421,7 +421,7 @@ func (c *Client) Revoke(ctx context.Context, token string) error {
 	if err != nil {
 		return fmt.Errorf("request token revocation: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return responseError("revoke", response)
 	}
@@ -492,7 +492,7 @@ func parseIssuer(rawIssuer string) (*url.URL, error) {
 	if hostname == "" {
 		return nil, errors.New("deviceauth: issuer URL host is required")
 	}
-	if issuer.Scheme != "https" && !(issuer.Scheme == "http" && isLoopbackHost(hostname)) {
+	if issuer.Scheme != "https" && (issuer.Scheme != "http" || !isLoopbackHost(hostname)) {
 		return nil, errors.New("deviceauth: issuer must use https unless its host is loopback")
 	}
 	port := issuer.Port()
