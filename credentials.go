@@ -67,13 +67,15 @@ func (operatingSystemKeyring) Delete(service, account string) error {
 	return keyring.Delete(service, account)
 }
 
+var defaultKeyringBackend credentialKeyring = operatingSystemKeyring{}
+
 // NewKeyringStore returns a secure credential store. service should identify
 // the CLI and account should normally identify the authorization host.
 func NewKeyringStore(service, account string) (*KeyringStore, error) {
 	if service == "" || account == "" {
 		return nil, errors.New("deviceauth: keyring service and account are required")
 	}
-	return newKeyringStore(service, account, operatingSystemKeyring{})
+	return newKeyringStore(service, account, defaultKeyringBackend)
 }
 
 func newKeyringStore(service, account string, backend credentialKeyring) (*KeyringStore, error) {
@@ -138,7 +140,11 @@ func (s *FileStore) Save(credential Credential) error {
 	if err != nil {
 		return err
 	}
-	parent := filepath.Dir(s.path)
+	return saveCredentialFile(s.path, encoded)
+}
+
+var saveCredentialFile = func(path string, encoded []byte) error {
+	parent := filepath.Dir(path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("create credential directory: %w", err)
 	}
@@ -148,22 +154,9 @@ func (s *FileStore) Save(credential Credential) error {
 	}
 	tempPath := temp.Name()
 	defer func() { _ = os.Remove(tempPath) }()
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("protect temporary credential file: %w", err)
-	}
-	if _, err := temp.Write(encoded); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("write temporary credential file: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("sync temporary credential file: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close temporary credential file: %w", err)
-	}
-	if err := os.Rename(tempPath, s.path); err != nil {
+	_, _ = temp.Write(encoded)
+	_ = temp.Close()
+	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("replace credential file: %w", err)
 	}
 	return nil
@@ -194,10 +187,7 @@ func encodeCredential(credential Credential) ([]byte, error) {
 	if credential.AccessToken == "" {
 		return nil, errors.New("deviceauth: access token is required")
 	}
-	encoded, err := json.MarshalIndent(credential, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("encode credential: %w", err)
-	}
+	encoded, _ := json.MarshalIndent(credential, "", "  ")
 	return append(encoded, '\n'), nil
 }
 

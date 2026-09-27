@@ -7,6 +7,13 @@ import (
 	"runtime"
 )
 
+var (
+	execCommandStart = func(name string, args ...string) error {
+		return exec.Command(name, args...).Start()
+	}
+	runtimeGOOS = runtime.GOOS
+)
+
 // OpenBrowser opens rawURL in the user's default browser. Callers should treat
 // errors as a reason to show a manual URL, not as a failed authorization.
 func OpenBrowser(rawURL string) error {
@@ -15,11 +22,11 @@ func OpenBrowser(rawURL string) error {
 		return fmt.Errorf("deviceauth: browser URL must be absolute")
 	}
 
-	name, args, err := browserCommand(runtime.GOOS, rawURL)
+	name, args, err := browserCommand(runtimeGOOS, rawURL)
 	if err != nil {
 		return err
 	}
-	return exec.Command(name, args...).Start()
+	return execCommandStart(name, args...)
 }
 
 func browserCommand(goos, rawURL string) (name string, args []string, err error) {

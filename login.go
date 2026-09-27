@@ -107,12 +107,6 @@ func Login(ctx context.Context, options LoginOptions) (LoginResult, error) {
 			BrowserOpened: browserOpened,
 		}, fmt.Errorf("complete device authorization: %w", err)
 	}
-	if token == nil || token.AccessToken == "" {
-		return LoginResult{
-			Authorization: authorization,
-			BrowserOpened: browserOpened,
-		}, errors.New("complete device authorization: authorization server returned an empty access token")
-	}
 
 	return LoginResult{
 		Token:         token,

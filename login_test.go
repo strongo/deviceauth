@@ -196,12 +196,43 @@ func TestLoginValidatesConfigurationBeforeRequest(t *testing.T) {
 func TestLoginUsesAbsoluteEndpoints(t *testing.T) {
 	t.Parallel()
 
+	// Missing DeviceAuthURL
 	_, err := Login(context.Background(), LoginOptions{
 		OAuthConfig: oauth2.Config{
 			ClientID: "test-cli",
 			Endpoint: oauth2.Endpoint{
-				DeviceAuthURL: "/device",
-				TokenURL:      "https://example.com/token",
+				TokenURL: "https://example.com/token",
+			},
+		},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "device authorization endpoint is required") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// Missing TokenURL
+	_, err = Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: "https://example.com/device",
+			},
+		},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "token endpoint is required") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// Relative TokenURL
+	_, err = Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: "https://example.com/device",
+				TokenURL:      "/token",
 			},
 		},
 		Output:      &bytes.Buffer{},
@@ -209,6 +240,156 @@ func TestLoginUsesAbsoluteEndpoints(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "absolute URL") {
 		t.Fatalf("error = %v", err)
+	}
+
+	// Missing Output
+	_, err = Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: "https://example.com/device",
+				TokenURL:      "https://example.com/token",
+			},
+		},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "output writer is required") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// Missing ErrorOutput
+	_, err = Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: "https://example.com/device",
+				TokenURL:      "https://example.com/token",
+			},
+		},
+		Output: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "error output writer is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failure")
+}
+
+func TestLoginDeviceAuthFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: server.URL + "/device",
+				TokenURL:      server.URL + "/token",
+			},
+		},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "request device authorization") {
+		t.Fatalf("expected device authorization error, got: %v", err)
+	}
+}
+
+func TestLoginOutputWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	server := immediateAuthorizationServer(t)
+	defer server.Close()
+
+	_, err := Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: server.URL + "/device",
+				TokenURL:      server.URL + "/token",
+			},
+		},
+		Output:      failWriter{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "write device authorization instructions") {
+		t.Fatalf("expected write error, got: %v", err)
+	}
+}
+
+func TestLoginTokenFailureAndEmptyToken(t *testing.T) {
+	t.Parallel()
+
+	// Token endpoint returns error
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device":
+			writeJSON(t, w, map[string]any{
+				"device_code":      "device-secret",
+				"user_code":        "ABCD-EFGH",
+				"verification_uri": server.URL + "/verify",
+				"expires_in":       600,
+			})
+		case "/token":
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	_, err := Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: server.URL + "/device",
+				TokenURL:      server.URL + "/token",
+			},
+		},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "complete device authorization") {
+		t.Fatalf("expected complete device authorization error, got: %v", err)
+	}
+}
+
+func TestLoginBrowserOpenFailure(t *testing.T) {
+	t.Parallel()
+
+	server := immediateAuthorizationServer(t)
+	defer server.Close()
+
+	errBuf := &bytes.Buffer{}
+	res, err := Login(context.Background(), LoginOptions{
+		OAuthConfig: oauth2.Config{
+			ClientID: "test-cli",
+			Endpoint: oauth2.Endpoint{
+				DeviceAuthURL: server.URL + "/device",
+				TokenURL:      server.URL + "/token",
+			},
+		},
+		Output:      &bytes.Buffer{},
+		ErrorOutput: errBuf,
+		OpenBrowser: func(string) error {
+			return errors.New("cannot open browser")
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected successful login despite browser error, got: %v", err)
+	}
+	if res.BrowserOpened {
+		t.Error("expected BrowserOpened to be false")
+	}
+	if !strings.Contains(errBuf.String(), "Could not open a browser automatically") {
+		t.Errorf("expected warning in ErrorOutput, got: %s", errBuf.String())
 	}
 }
 

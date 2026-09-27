@@ -27,4 +27,4 @@ jobs:
       cgo_enabled: false
       disable-version-bumping: false
       code_coverage: true
-      min_test_coverage_percent: 70
+      min_test_coverage_percent: 100

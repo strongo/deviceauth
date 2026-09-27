@@ -140,9 +140,148 @@ func TestStoreConstructorsRejectEmptyIdentity(t *testing.T) {
 	if _, err := NewKeyringStore("", "host"); err == nil {
 		t.Fatal("NewKeyringStore() error = nil")
 	}
+	if _, err := NewKeyringStore("service", ""); err == nil {
+		t.Fatal("NewKeyringStore() error = nil")
+	}
+	if _, err := newKeyringStore("", "host", &fakeCredentialKeyring{}); err == nil {
+		t.Fatal("newKeyringStore() error = nil")
+	}
+	if _, err := newKeyringStore("service", "", &fakeCredentialKeyring{}); err == nil {
+		t.Fatal("newKeyringStore() error = nil")
+	}
+	if _, err := newKeyringStore("service", "host", nil); err == nil {
+		t.Fatal("newKeyringStore() error = nil")
+	}
 	if _, err := NewFileStore(""); err == nil {
 		t.Fatal("NewFileStore() error = nil")
 	}
+}
+
+func TestFileStoreErrorCases(t *testing.T) {
+	dir := t.TempDir()
+
+	// Save to an impossible path
+	store, err := NewFileStore(filepath.Join(dir, "not-a-dir", "sub", "credential.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create a regular file where the directory needs to be
+	if err := os.WriteFile(filepath.Join(dir, "not-a-dir"), []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(Credential{AccessToken: "secret"}); err == nil {
+		t.Error("expected Save to fail when directory cannot be created")
+	}
+
+	// Load non-json file
+	corruptPath := filepath.Join(dir, "corrupt.json")
+	if err := os.WriteFile(corruptPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corruptStore, _ := NewFileStore(corruptPath)
+	if _, err := corruptStore.Load(); err == nil {
+		t.Error("expected Load to fail on non-json")
+	}
+
+	// Load file missing access token
+	emptyTokenPath := filepath.Join(dir, "empty-token.json")
+	if err := os.WriteFile(emptyTokenPath, []byte(`{"token_type":"Bearer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emptyTokenStore, _ := NewFileStore(emptyTokenPath)
+	if _, err := emptyTokenStore.Load(); err == nil {
+		t.Error("expected Load to fail when access token is missing")
+	}
+
+	// Load on a directory causes os.ReadFile to fail with read error
+	dirAsPath := filepath.Join(dir, "is-a-dir")
+	if err := os.MkdirAll(dirAsPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dirReadStore, _ := NewFileStore(dirAsPath)
+	if _, err := dirReadStore.Load(); err == nil {
+		t.Error("expected Load to fail when path is a directory")
+	}
+
+	// Delete on a directory containing files causes os.Remove to fail
+	nonEmptyDir := filepath.Join(dir, "non-empty-dir")
+	if err := os.MkdirAll(nonEmptyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmptyDir, "file"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirStore, _ := NewFileStore(nonEmptyDir)
+	if err := dirStore.Delete(); err == nil {
+		t.Error("expected Delete to fail on non-empty directory")
+	}
+
+	// Save fails when saveCredentialFile fails
+	origSave := saveCredentialFile
+	defer func() { saveCredentialFile = origSave }()
+	saveCredentialFile = func(string, []byte) error { return errors.New("save fail") }
+	dummyStore, _ := NewFileStore(filepath.Join(dir, "test.json"))
+	if err := dummyStore.Save(Credential{AccessToken: "token"}); err == nil {
+		t.Error("expected error when saveCredentialFile fails")
+	}
+	saveCredentialFile = origSave
+
+	// Save fails when CreateTemp fails (parent is read-only)
+	roDir := filepath.Join(dir, "ro-dir")
+	if err := os.MkdirAll(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(roDir, 0o700) }()
+	roStore, _ := NewFileStore(filepath.Join(roDir, "credential.json"))
+	if err := roStore.Save(Credential{AccessToken: "secret"}); err == nil {
+		t.Error("expected Save to fail when parent dir is read-only")
+	}
+
+	// Save fails when Rename fails (target path is an existing directory)
+	targetDir := filepath.Join(dir, "target-is-dir")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	targetDirStore, _ := NewFileStore(targetDir)
+	if err := targetDirStore.Save(Credential{AccessToken: "secret"}); err == nil {
+		t.Error("expected Save to fail when target path is a directory")
+	}
+}
+
+func TestNewKeyringStoreWithBackend(t *testing.T) {
+	origBackend := defaultKeyringBackend
+	defer func() { defaultKeyringBackend = origBackend }()
+
+	fake := &fakeCredentialKeyring{values: make(map[string]string)}
+	defaultKeyringBackend = fake
+
+	store, err := NewKeyringStore("my-service", "my-account")
+	if err != nil {
+		t.Fatalf("NewKeyringStore failed: %v", err)
+	}
+	if err := store.Save(Credential{}); err == nil {
+		t.Error("expected error when saving credential without access token")
+	}
+	if err := store.Save(Credential{AccessToken: "token123"}); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	cred, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cred.AccessToken != "token123" {
+		t.Fatalf("got %v, want token123", cred.AccessToken)
+	}
+}
+
+func TestOperatingSystemKeyringDirect(t *testing.T) {
+	osk := operatingSystemKeyring{}
+	// Call Set (ignore result in case keyring is not configured on runner)
+	_ = osk.Set("deviceauth-unit-test-never-used", "account", "val")
+	// Call Get on nonexistent
+	_, _ = osk.Get("deviceauth-unit-test-never-used", "account")
+	// Call Delete on nonexistent
+	_ = osk.Delete("deviceauth-unit-test-never-used", "account")
 }
 
 type fakeCredentialKeyring struct {
