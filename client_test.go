@@ -231,6 +231,7 @@ func TestNewClientCanonicalizesAndRestrictsIssuer(t *testing.T) {
 }
 
 func TestClientDeviceLoginPollsAuthorizationPending(t *testing.T) {
+	t.Parallel()
 	var tokenRequests atomic.Int32
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,6 +275,7 @@ func TestClientDeviceLoginPollsAuthorizationPending(t *testing.T) {
 }
 
 func TestClientDeviceLoginAndStoreRevokesTokensAfterStoreFailure(t *testing.T) {
+	t.Parallel()
 	var revoked []string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -325,6 +327,7 @@ func TestValidateRequiredScopes(t *testing.T) {
 }
 
 func TestClientDeviceLoginAndStoreRevokesBootstrapAfterTransformFailure(t *testing.T) {
+	t.Parallel()
 	var revoked string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -362,6 +365,7 @@ func TestClientDeviceLoginAndStoreRevokesBootstrapAfterTransformFailure(t *testi
 }
 
 func TestClientDeviceLoginAndStoreRevokesReplacedCredential(t *testing.T) {
+	t.Parallel()
 	var revoked string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -396,6 +400,7 @@ func TestClientDeviceLoginAndStoreRevokesReplacedCredential(t *testing.T) {
 }
 
 func TestClientDeviceLoginAndStoreWarnsWhenReplacedCredentialCannotBeRevoked(t *testing.T) {
+	t.Parallel()
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -432,6 +437,7 @@ func TestClientDeviceLoginAndStoreWarnsWhenReplacedCredentialCannotBeRevoked(t *
 }
 
 func TestClientDeviceLoginAndStoreCleansUpAfterCallerCancellation(t *testing.T) {
+	t.Parallel()
 	var revoked string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

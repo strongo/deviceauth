@@ -7,7 +7,7 @@ import (
 )
 
 func TestOpenBrowser(t *testing.T) {
-	// Restore seams after test
+	// Not parallel: mutates package-level execCommandStart and runtimeGOOS seams.
 	origExec := execCommandStart
 	origGOOS := runtimeGOOS
 	defer func() {
@@ -50,6 +50,7 @@ func TestOpenBrowser(t *testing.T) {
 }
 
 func TestBrowserCommand_Unsupported(t *testing.T) {
+	t.Parallel()
 	_, _, err := browserCommand("unsupported_os", "https://example.com")
 	if err == nil {
 		t.Error("expected error for unsupported OS")

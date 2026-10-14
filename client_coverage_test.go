@@ -15,6 +15,7 @@ import (
 )
 
 func TestNewClientValidation(t *testing.T) {
+	t.Parallel()
 	for name, cfg := range map[string]ClientConfig{
 		"empty issuer": {
 			Issuer:   "",
@@ -61,6 +62,7 @@ func TestNewClientValidation(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			_, err := NewClient(cfg)
 			if err == nil {
 				t.Fatalf("expected error for %s", name)
@@ -91,6 +93,7 @@ func TestNewClientValidation(t *testing.T) {
 }
 
 func TestUserInfoEdgeCases(t *testing.T) {
+	t.Parallel()
 	client := newTestClient(t, "https://example.com", "test-client")
 	ctx := context.Background()
 
@@ -173,6 +176,7 @@ func TestUserInfoEdgeCases(t *testing.T) {
 }
 
 func TestDeviceLoginAndStoreEdgeCases(t *testing.T) {
+	t.Parallel()
 	client := newTestClient(t, "https://example.com", "test-client")
 	ctx := context.Background()
 
@@ -270,6 +274,7 @@ func TestDeviceLoginAndStoreEdgeCases(t *testing.T) {
 }
 
 func TestRevocationWarningAndUnwrap(t *testing.T) {
+	t.Parallel()
 	warn := &ReplacementRevocationWarning{Cause: errors.New("revoke failed")}
 	if !strings.Contains(warn.Error(), "previous credential could not be revoked") {
 		t.Errorf("unexpected error message: %s", warn.Error())
@@ -280,6 +285,7 @@ func TestRevocationWarningAndUnwrap(t *testing.T) {
 }
 
 func TestLogoutEdgeCases(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	// Nil store
@@ -339,6 +345,7 @@ func TestLogoutEdgeCases(t *testing.T) {
 }
 
 func TestRevokeEdgeCases(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, "https://example.com", "test-client")
 	ctx := context.Background()
 
@@ -356,6 +363,7 @@ func TestRevokeEdgeCases(t *testing.T) {
 }
 
 func TestNewKeyringStoreOnClient(t *testing.T) {
+	// Not parallel: mutates package-level defaultKeyringBackend seam.
 	origBackend := defaultKeyringBackend
 	defer func() { defaultKeyringBackend = origBackend }()
 	fake := &fakeCredentialKeyring{values: make(map[string]string)}
@@ -388,6 +396,7 @@ func TestNewKeyringStoreOnClient(t *testing.T) {
 }
 
 func TestHelpers(t *testing.T) {
+	t.Parallel()
 	// redactTokens
 	if err := redactTokens(nil, map[string]struct{}{"tok": {}}); err != nil {
 		t.Error("expected nil for nil err")
@@ -463,6 +472,7 @@ func TestHelpers(t *testing.T) {
 }
 
 func TestClientAdditionalCoverage(t *testing.T) {
+	// Not parallel: mutates package-level defaultKeyringBackend seam.
 	ctx := context.Background()
 
 	// Line 151 & 416: invalid URL endpoint causes http.NewRequestWithContext to fail

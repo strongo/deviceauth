@@ -158,6 +158,7 @@ func TestStoreConstructorsRejectEmptyIdentity(t *testing.T) {
 }
 
 func TestFileStoreErrorCases(t *testing.T) {
+	// Not parallel: mutates package-level saveCredentialFile seam.
 	dir := t.TempDir()
 
 	// Save to an impossible path
@@ -249,6 +250,7 @@ func TestFileStoreErrorCases(t *testing.T) {
 }
 
 func TestNewKeyringStoreWithBackend(t *testing.T) {
+	// Not parallel: mutates package-level defaultKeyringBackend seam.
 	origBackend := defaultKeyringBackend
 	defer func() { defaultKeyringBackend = origBackend }()
 
@@ -275,6 +277,7 @@ func TestNewKeyringStoreWithBackend(t *testing.T) {
 }
 
 func TestOperatingSystemKeyringDirect(t *testing.T) {
+	t.Parallel()
 	osk := operatingSystemKeyring{}
 	// Call Set (ignore result in case keyring is not configured on runner)
 	_ = osk.Set("deviceauth-unit-test-never-used", "account", "val")
