@@ -35,3 +35,22 @@ server can identify the requesting device during consent. It is informational,
 untrusted metadata; authorization state and timestamps remain server-owned.
 
 The module is MIT licensed.
+
+## Moving an authorization service to a new host
+
+`Client` binds every saved credential to its `Issuer`. When a service moves,
+configure the new base URL as `Issuer` and list the old one in both:
+
+- `PreviousIssuers`: a stored credential bound to an old issuer loads as
+  `*IssuerMovedError` (it matches `ErrCredentialIssuerMoved` and
+  `ErrCredentialScopeMismatch`). `DeviceLoginAndStore` prints one notice line
+  (`DeviceLoginOptions.IssuerMovedNotice`, or `DefaultIssuerMovedNotice`),
+  runs a fresh login and revokes the old grant at the new issuer; `Logout`
+  revokes it there too. `NewKeyringStore` also looks under the old issuer's
+  keyring identity, and `NewMigratingStore` does the same for other stores.
+- `FallbackIssuers`: lets a client ship before the new host serves. Until
+  `Issuer` has answered once, a transport failure (DNS, connection, TLS) or
+  HTTP 404 retries the request at the next fallback; the first base URL that
+  answers serves the rest of the `Client`'s lifetime. Credentials stay bound
+  to `Issuer`. Configure fallbacks only for a default production issuer, never
+  for an operator override, and remove them once the move is complete.
