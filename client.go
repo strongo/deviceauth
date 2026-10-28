@@ -24,7 +24,7 @@ var ErrCredentialScopeMismatch = errors.New("deviceauth: credential issuer or cl
 
 // ClientConfig configures a reusable device-authorization client for one
 // OAuth issuer and public CLI client. Issuer is the base URL, for example
-// "https://auth.sneat.co". KeyringService and KeyringAccount are product
+// "https://oauth.sneat.co". KeyringService and KeyringAccount are product
 // chosen names used only when NewKeyringStore is called.
 type ClientConfig struct {
 	Issuer   string
@@ -36,6 +36,21 @@ type ClientConfig struct {
 	RequiredScopes []string
 	KeyringService string
 	KeyringAccount string
+	// PreviousIssuers lists base URLs at which this same authorization service
+	// answered before it moved to Issuer. A stored credential bound to one of
+	// them (and to ClientID) loads as *IssuerMovedError rather than a plain
+	// scope mismatch, so a caller can explain the move and start a fresh
+	// login. NewKeyringStore also finds credentials saved under their keyring
+	// identities. New credentials are always bound to Issuer.
+	PreviousIssuers []string
+	// FallbackIssuers lists base URLs that serve this same authorization
+	// service while Issuer does not answer yet. Until Issuer has answered, a
+	// transport failure (DNS, connection, TLS) or HTTP 404 from it moves the
+	// request to the next fallback; the first base URL that answers is used
+	// for the rest of this Client's lifetime. Credentials stay bound to Issuer.
+	// Callers should configure fallbacks only for their default production
+	// issuer, never for an operator override.
+	FallbackIssuers []string
 }
 
 // Client provides the neutral client-side half of a device authorization
@@ -48,6 +63,9 @@ type Client struct {
 	requiredScopes []string
 	keyringService string
 	keyringAccount string
+
+	previousIssuers []string
+	router          *issuerRouter
 }
 
 // NewClient validates config and returns a client for an OAuth service.
@@ -68,14 +86,27 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if err := validateRequiredScopesRequested(scopes, requiredScopes); err != nil {
 		return nil, err
 	}
-	return &Client{
-		issuer:         issuer,
-		clientID:       clientID,
-		scopes:         scopes,
-		requiredScopes: requiredScopes,
-		keyringService: strings.TrimSpace(config.KeyringService),
-		keyringAccount: strings.TrimSpace(config.KeyringAccount),
-	}, nil
+	previousIssuers, err := parseIssuers("previous issuer", issuer, config.PreviousIssuers)
+	if err != nil {
+		return nil, err
+	}
+	fallbackIssuers, err := parseIssuers("fallback issuer", issuer, config.FallbackIssuers)
+	if err != nil {
+		return nil, err
+	}
+	client := &Client{
+		issuer:          issuer,
+		clientID:        clientID,
+		scopes:          scopes,
+		requiredScopes:  requiredScopes,
+		keyringService:  strings.TrimSpace(config.KeyringService),
+		keyringAccount:  strings.TrimSpace(config.KeyringAccount),
+		previousIssuers: issuerStrings(previousIssuers),
+	}
+	if len(fallbackIssuers) > 0 {
+		client.router = &issuerRouter{primary: issuer, fallbacks: fallbackIssuers}
+	}
+	return client, nil
 }
 
 // Issuer returns the canonical base URL configured for this client.
@@ -103,6 +134,10 @@ type DeviceLoginOptions struct {
 	Output           io.Writer
 	ErrorOutput      io.Writer
 	TokenTransformer TokenTransformer
+	// IssuerMovedNotice is written as one line to ErrorOutput when
+	// DeviceLoginAndStore replaces a credential bound to a previous issuer.
+	// Empty selects DefaultIssuerMovedNotice.
+	IssuerMovedNotice string
 }
 
 // TokenTransformer converts the token returned by the device token endpoint
@@ -119,6 +154,7 @@ type TokenTransformer func(context.Context, *oauth2.Token) (*oauth2.Token, error
 // configured service. It preserves the package Login function for existing
 // consumers such as OVDB.
 func (c *Client) DeviceLogin(ctx context.Context, options DeviceLoginOptions) (LoginResult, error) {
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, c.httpClient(ctx))
 	return Login(ctx, LoginOptions{
 		OAuthConfig: c.OAuthConfig(),
 		DeviceInfo:  options.DeviceInfo,
@@ -156,7 +192,7 @@ func (c *Client) UserInfo(ctx context.Context, token *oauth2.Token) (Identity, e
 	}
 	req.Header.Set("Accept", "application/json")
 
-	response, err := httpClient(ctx).Do(req)
+	response, err := c.httpClient(ctx).Do(req)
 	if err != nil {
 		return Identity{}, fmt.Errorf("request userinfo: %w", err)
 	}
@@ -232,6 +268,21 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 	}
 	scopedStore := c.ScopedStore(store)
 	previous, err := scopedStore.Load()
+	var moved *IssuerMovedError
+	if errors.As(err, &moved) {
+		// The service moved since this credential was saved. Replace it with a
+		// fresh login and revoke it at the current issuer like any replaced
+		// credential.
+		previous, err = moved.Credential, nil
+		notice := options.IssuerMovedNotice
+		if notice == "" {
+			notice = DefaultIssuerMovedNotice(moved)
+		}
+		if options.ErrorOutput == nil {
+			return Authentication{}, errors.New("deviceauth: error output writer is required")
+		}
+		_, _ = fmt.Fprintln(options.ErrorOutput, notice)
+	}
 	if err != nil && !errors.Is(err, ErrCredentialNotFound) {
 		return Authentication{}, fmt.Errorf("load existing device credential: %w", err)
 	}
@@ -365,7 +416,7 @@ func redactTokens(err error, tokenSet map[string]struct{}) error {
 // ScopedStore wraps store so every saved credential is bound to this issuer
 // and client. Load rejects a credential saved for a different pair.
 func (c *Client) ScopedStore(store Store) Store {
-	return scopedStore{store: store, issuer: c.Issuer(), clientID: c.clientID}
+	return scopedStore{store: store, issuer: c.Issuer(), clientID: c.clientID, previousIssuers: c.previousIssuers}
 }
 
 // NewKeyringStore returns an issuer/client-isolated keyring store. It requires
@@ -374,11 +425,20 @@ func (c *Client) NewKeyringStore() (Store, error) {
 	if c.keyringService == "" || c.keyringAccount == "" {
 		return nil, errors.New("deviceauth: keyring service and account are required to create a keyring store")
 	}
-	store, err := NewKeyringStore(c.keyringService, c.keyringIdentity())
+	store, err := NewKeyringStore(c.keyringService, c.keyringIdentity(c.Issuer()))
 	if err != nil {
 		return nil, err
 	}
-	return c.ScopedStore(store), nil
+	if len(c.previousIssuers) == 0 {
+		return c.ScopedStore(store), nil
+	}
+	previous := make([]Store, 0, len(c.previousIssuers))
+	for _, issuer := range c.previousIssuers {
+		// Service and account are non-empty here, so construction cannot fail.
+		previousStore, _ := NewKeyringStore(c.keyringService, c.keyringIdentity(issuer))
+		previous = append(previous, previousStore)
+	}
+	return c.ScopedStore(NewMigratingStore(store, previous...)), nil
 }
 
 // Logout revokes the stored access token at the issuer before removing the
@@ -391,6 +451,12 @@ func (c *Client) Logout(ctx context.Context, store Store) error {
 	credential, err := c.ScopedStore(store).Load()
 	if errors.Is(err, ErrCredentialNotFound) {
 		return nil
+	}
+	var moved *IssuerMovedError
+	if errors.As(err, &moved) {
+		// The same service now answers at the current issuer, so the grant
+		// is revoked there.
+		credential, err = moved.Credential, nil
 	}
 	if err != nil {
 		return fmt.Errorf("load device credential for logout: %w", err)
@@ -417,7 +483,7 @@ func (c *Client) Revoke(ctx context.Context, token string) error {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	response, err := httpClient(ctx).Do(req)
+	response, err := c.httpClient(ctx).Do(req)
 	if err != nil {
 		return fmt.Errorf("request token revocation: %w", err)
 	}
@@ -435,8 +501,8 @@ func (c *Client) endpoint(suffix string) string {
 	return endpoint.String()
 }
 
-func (c *Client) keyringIdentity() string {
-	return c.keyringAccount + "|issuer=" + url.QueryEscape(c.Issuer()) + "|client_id=" + url.QueryEscape(c.clientID)
+func (c *Client) keyringIdentity(issuer string) string {
+	return c.keyringAccount + "|issuer=" + url.QueryEscape(issuer) + "|client_id=" + url.QueryEscape(c.clientID)
 }
 
 func (c *Client) bindCredential(credential Credential) Credential {
@@ -446,9 +512,10 @@ func (c *Client) bindCredential(credential Credential) Credential {
 }
 
 type scopedStore struct {
-	store    Store
-	issuer   string
-	clientID string
+	store           Store
+	issuer          string
+	clientID        string
+	previousIssuers []string
 }
 
 func (s scopedStore) Save(credential Credential) error {
@@ -464,6 +531,9 @@ func (s scopedStore) Load() (Credential, error) {
 	credential, err := s.store.Load()
 	if err != nil {
 		return Credential{}, err
+	}
+	if credential.ClientID == s.clientID && contains(s.previousIssuers, credential.Issuer) {
+		return Credential{}, &IssuerMovedError{PreviousIssuer: credential.Issuer, Issuer: s.issuer, Credential: credential}
 	}
 	if credential.Issuer != s.issuer || credential.ClientID != s.clientID {
 		return Credential{}, ErrCredentialScopeMismatch
