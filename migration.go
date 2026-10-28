@@ -137,6 +137,28 @@ type issuerRouter struct {
 
 	mu     sync.Mutex
 	chosen *url.URL
+	probe  chan struct{}
+}
+
+// acquireProbe serializes requests until a serving issuer is selected. A
+// waiter can abandon the selection promptly when its context is cancelled.
+func (r *issuerRouter) acquireProbe(ctx context.Context) (func(), error) {
+	r.mu.Lock()
+	if r.chosen != nil {
+		r.mu.Unlock()
+		return func() {}, nil
+	}
+	if r.probe == nil {
+		r.probe = make(chan struct{}, 1)
+	}
+	probe := r.probe
+	r.mu.Unlock()
+	select {
+	case probe <- struct{}{}:
+		return func() { <-probe }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (r *issuerRouter) candidates() []*url.URL {
@@ -190,6 +212,11 @@ func (t fallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if !t.router.routes(req.URL) {
 		return t.base.RoundTrip(req)
 	}
+	release, err := t.router.acquireProbe(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	var body []byte
 	if req.Body != nil {
 		var err error

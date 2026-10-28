@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -408,6 +409,69 @@ func TestFallbackRespectsCallerCancellation(t *testing.T) {
 	}
 	if fallbackHits.Load() != 0 {
 		t.Fatalf("fallback hits = %d after cancellation", fallbackHits.Load())
+	}
+}
+
+// Concurrent first requests must not return responses from different issuers:
+// a later token request must reach the server that issued the device code.
+func TestFallbackConcurrentInitialRequestsUseSameIssuer(t *testing.T) {
+	primary, _ := url.Parse("https://new.example")
+	fallback, _ := url.Parse("https://old.example")
+	router := &issuerRouter{primary: primary, fallbacks: []*url.URL{fallback}}
+	fallbackEntered := make(chan struct{})
+	releaseFallback := make(chan struct{})
+	var primaryCalls atomic.Int32
+	transport := fallbackTransport{router: router, base: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == primary.Host && primaryCalls.Add(1) == 1 {
+			return nil, errors.New("connection refused")
+		}
+		if req.URL.Host == fallback.Host && req.URL.Path == "/first" {
+			close(fallbackEntered)
+			<-releaseFallback
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(req.URL.Host)), Request: req}, nil
+	})}
+	result := make(chan string, 2)
+	request := func(path string) {
+		req, _ := http.NewRequest(http.MethodGet, primary.String()+path, nil)
+		response, err := transport.RoundTrip(req)
+		if err != nil {
+			result <- err.Error()
+			return
+		}
+		defer func() { _ = response.Body.Close() }()
+		body, _ := io.ReadAll(response.Body)
+		result <- string(body)
+	}
+	go request("/first")
+	<-fallbackEntered
+	go request("/second")
+	// Give the second request an opportunity to race the unresolved first one.
+	time.Sleep(100 * time.Millisecond)
+	close(releaseFallback)
+	first, second := <-result, <-result
+	if first != fallback.Host || second != fallback.Host || router.serving() != fallback.String() {
+		t.Fatalf("responses %q, %q; serving %q", first, second, router.serving())
+	}
+}
+
+func TestFallbackWaitingForInitialSelectionRespectsCancellation(t *testing.T) {
+	primary, _ := url.Parse("https://new.example")
+	router := &issuerRouter{primary: primary}
+	release, err := router.acquireProbe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	transport := fallbackTransport{router: router, base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("cancelled waiter contacted an issuer")
+		return nil, errors.New("unexpected request")
+	})}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, primary.String()+"/oauth/token", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RoundTrip error = %v, want context.Canceled", err)
 	}
 }
 
