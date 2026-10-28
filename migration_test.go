@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -198,6 +197,15 @@ func TestDeviceLoginAndStoreReplacesMovedCredential(t *testing.T) {
 				t.Fatalf("old credential was not revoked at the current issuer: %v", served)
 			}
 		})
+	}
+}
+
+func TestMovedCredentialWithNilErrorOutputReturnsError(t *testing.T) {
+	client := newMigrationClient(t, ClientConfig{Issuer: "https://new.example", PreviousIssuers: []string{"https://old.example"}})
+	store := &memoryStore{credential: Credential{AccessToken: "old", Issuer: "https://old.example", ClientID: "sneat-cli"}}
+	_, err := client.DeviceLoginAndStore(context.Background(), DeviceLoginOptions{Output: io.Discard}, store)
+	if err == nil || err.Error() != "deviceauth: error output writer is required" {
+		t.Fatalf("DeviceLoginAndStore error = %v", err)
 	}
 }
 
@@ -432,8 +440,8 @@ func TestFallbackConcurrentInitialRequestsUseSameIssuer(t *testing.T) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(req.URL.Host)), Request: req}, nil
 	})}
 	result := make(chan string, 2)
-	request := func(path string) {
-		req, _ := http.NewRequest(http.MethodGet, primary.String()+path, nil)
+	request := func(ctx context.Context, path string) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, primary.String()+path, nil)
 		response, err := transport.RoundTrip(req)
 		if err != nil {
 			result <- err.Error()
@@ -443,17 +451,101 @@ func TestFallbackConcurrentInitialRequestsUseSameIssuer(t *testing.T) {
 		body, _ := io.ReadAll(response.Body)
 		result <- string(body)
 	}
-	go request("/first")
+	go request(context.Background(), "/first")
 	<-fallbackEntered
-	go request("/second")
-	// Give the second request an opportunity to race the unresolved first one.
-	time.Sleep(100 * time.Millisecond)
+	entered := make(chan struct{})
+	ctx := &observedDoneContext{Context: context.Background(), entered: entered}
+	go request(ctx, "/second")
+	// Either the waiter has entered the probe select or the old implementation
+	// has already returned from the wrong issuer. Both are observable events.
+	select {
+	case <-entered:
+	case premature := <-result:
+		close(releaseFallback)
+		<-result
+		t.Fatalf("second request escaped unresolved selection: %q", premature)
+	}
 	close(releaseFallback)
 	first, second := <-result, <-result
 	if first != fallback.Host || second != fallback.Host || router.serving() != fallback.String() {
 		t.Fatalf("responses %q, %q; serving %q", first, second, router.serving())
 	}
 }
+
+type observedDoneContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
+func TestCanceledInitialRequestDoesNotChooseIssuer(t *testing.T) {
+	primary, _ := url.Parse("https://new.example")
+	fallback, _ := url.Parse("https://old.example")
+	router := &issuerRouter{primary: primary, fallbacks: []*url.URL{fallback}}
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls atomic.Int32
+	transport := fallbackTransport{router: router, base: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			cancel()
+			return nil, context.Canceled
+		}
+		if req.URL.Host == primary.Host {
+			return nil, errors.New("connection refused")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+	})}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, primary.String()+"/oauth/device/code", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first error = %v", err)
+	}
+	if got := router.serving(); got != "" {
+		t.Fatalf("canceled request chose %q", got)
+	}
+	req, _ = http.NewRequest(http.MethodGet, primary.String()+"/oauth/device/code", nil)
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if got := router.serving(); got != fallback.String() {
+		t.Fatalf("serving = %q", got)
+	}
+}
+
+func TestCanceledFallbackClosesPrimaryResponse(t *testing.T) {
+	primary, _ := url.Parse("https://new.example")
+	fallback, _ := url.Parse("https://old.example")
+	router := &issuerRouter{primary: primary, fallbacks: []*url.URL{fallback}}
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := false
+	body := &closeObservedBody{Reader: strings.NewReader("missing"), closed: &closed}
+	transport := fallbackTransport{router: router, base: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == primary.Host {
+			return &http.Response{StatusCode: 404, Body: body, Request: req}, nil
+		}
+		cancel()
+		return nil, context.Canceled
+	})}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, primary.String()+"/oauth/device/code", nil)
+	if _, err := transport.RoundTrip(req); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if !closed || router.serving() != "" {
+		t.Fatalf("closed = %v, serving = %q", closed, router.serving())
+	}
+}
+
+type closeObservedBody struct {
+	io.Reader
+	closed *bool
+}
+
+func (b *closeObservedBody) Close() error { *b.closed = true; return nil }
 
 func TestFallbackWaitingForInitialSelectionRespectsCancellation(t *testing.T) {
 	primary, _ := url.Parse("https://new.example")

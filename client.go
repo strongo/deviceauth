@@ -278,6 +278,9 @@ func (c *Client) DeviceLoginAndStore(ctx context.Context, options DeviceLoginOpt
 		if notice == "" {
 			notice = DefaultIssuerMovedNotice(moved)
 		}
+		if options.ErrorOutput == nil {
+			return Authentication{}, errors.New("deviceauth: error output writer is required")
+		}
 		_, _ = fmt.Fprintln(options.ErrorOutput, notice)
 	}
 	if err != nil && !errors.Is(err, ErrCredentialNotFound) {

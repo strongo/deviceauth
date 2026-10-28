@@ -238,6 +238,12 @@ func (t fallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			attempt.ContentLength = int64(len(body))
 		}
 		response, err := t.base.RoundTrip(attempt)
+		if err != nil && req.Context().Err() != nil {
+			if firstResponse != nil {
+				_ = firstResponse.Body.Close()
+			}
+			return response, err
+		}
 		if !notServing(req.Context(), response, err) {
 			t.router.choose(base)
 			if firstResponse != nil {
