@@ -2,11 +2,11 @@ module github.com/strongo/deviceauth
 
 go 1.26.1
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/oauth2 v0.37.0
+	golang.org/x/oauth2 v0.38.0
 )
 
 require (
